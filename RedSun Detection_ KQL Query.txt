@@ -1,0 +1,293 @@
+// RedSun detection query
+// Focus: Defender remediation abuse → file overwrite → privilege escalation
+// Auth: Rami Mustafa, Microsoft CSA
+//#########################################################################
+
+DeviceProcessEvents
+| where Timestamp > ago(3d)
+| where AccountName =~ "SYSTEM"
+| where InitiatingProcessAccountName !in~ ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| where FileName !in~ ("TiWorker.exe", "TrustedInstaller.exe", "msiexec.exe", "poqexec.exe", "dismhost.exe", "UsoWorker.exe", "MoUsoCoreWorker.exe", "sedsvc.exe")
+| extend
+    EscalationTime = Timestamp,
+    ProcessName = tostring(FileName),
+    ProcessCmd = tostring(ProcessCommandLine),
+    ProcessPath = tostring(FolderPath),
+    ProcessId = tostring(ProcessId),
+    ProcessSHA1 = tostring(SHA1),
+    ProcessSHA256 = tostring(SHA256),
+    ProcessMD5 = tostring(MD5),
+    ParentProcess = tostring(InitiatingProcessFileName),
+    ParentCmd = tostring(InitiatingProcessCommandLine),
+    ParentPath = tostring(InitiatingProcessFolderPath),
+    ParentProcessId = tostring(InitiatingProcessId),
+    ParentSHA1 = tostring(InitiatingProcessSHA1),
+    ParentSHA256 = tostring(InitiatingProcessSHA256),
+    ParentMD5 = tostring(InitiatingProcessMD5),
+    EscalationAccount = strcat(tostring(AccountDomain), "\\", tostring(AccountName)),
+    EscalationAccountSid = tostring(AccountSid),
+    InitiatingAccount = strcat(tostring(InitiatingProcessAccountDomain), "\\", tostring(InitiatingProcessAccountName)),
+    InitiatingAccountName = tostring(InitiatingProcessAccountName),
+    InitiatingAccountDomain = tostring(InitiatingProcessAccountDomain),
+    InitiatingAccountSid = tostring(InitiatingProcessAccountSid),
+    ParentIntegrity = tostring(InitiatingProcessIntegrityLevel)
+| extend
+    SuspiciousParentChild = iff(
+        tolower(ParentProcess) in~ ("services.exe", "svchost.exe", "msmpeng.exe", "sense.exe", "trustedinstaller.exe")
+        and tolower(ProcessName) in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "rundll32.exe", "reg.exe", "sc.exe", "schtasks.exe", "wmic.exe", "net.exe", "net1.exe"),
+        1,
+        iff(tolower(ParentProcess) in~ ("msmpeng.exe", "sense.exe"), 1, 0)
+    )
+| extend
+    HasDefenderReference = iff(
+        tolower(ProcessCmd) contains "windows defender"
+        or tolower(ProcessCmd) contains "microsoft defender"
+        or tolower(ProcessCmd) contains "windefend"
+        or tolower(ProcessCmd) contains "msmpeng.exe"
+        or tolower(ProcessCmd) contains "mpcmdrun.exe"
+        or tolower(ProcessCmd) contains "sense.exe"
+        or tolower(ProcessCmd) contains "set-mppreference"
+        or tolower(ProcessCmd) contains "add-mppreference"
+        or tolower(ProcessCmd) contains "remove-mppreference"
+        or tolower(ProcessCmd) contains "disablebehaviormonitoring"
+        or tolower(ProcessCmd) contains "disablerealtimemonitoring"
+        or tolower(ProcessCmd) contains "disableioavprotection"
+        or tolower(ProcessCmd) contains "disabletamperprotection"
+        or tolower(ProcessCmd) contains "exclusionpath"
+        or tolower(ProcessCmd) contains "exclusionprocess"
+        or tolower(ProcessCmd) contains "exclusionextension"
+        or tolower(ParentCmd) contains "windows defender"
+        or tolower(ParentCmd) contains "microsoft defender"
+        or tolower(ParentCmd) contains "windefend"
+        or tolower(ParentCmd) contains "msmpeng.exe"
+        or tolower(ParentCmd) contains "mpcmdrun.exe"
+        or tolower(ParentCmd) contains "sense.exe"
+        or tolower(ParentProcess) in~ ("msmpeng.exe", "sense.exe"),
+        1,
+        0
+    )
+| where SuspiciousParentChild == 1 or HasDefenderReference == 1
+| join kind=leftouter (
+    DeviceFileEvents
+    | where Timestamp > ago(3d)
+    | where InitiatingProcessAccountName !in~ ("SYSTEM","LOCAL SERVICE","NETWORK SERVICE")
+    | where FolderPath has "\\AppData\\" or FolderPath has "\\Temp\\" or FolderPath has "\\ProgramData\\"
+    | where ActionType in~ ("FileCreated","FileModified","FileRenamed")
+    | where FileName endswith ".tmp"
+        or FileName endswith ".dat"
+        or FileName endswith ".lnk"
+        or FileName endswith ".db"
+        or tostring(AdditionalFields) contains "reparse"
+        or tostring(AdditionalFields) contains "junction"
+        or tostring(AdditionalFields) contains "symlink"
+    | project
+        DeviceId,
+        FsTime = Timestamp,
+        FsPath = tostring(FolderPath),
+        FsFile = tostring(FileName),
+        FsAction = tostring(ActionType),
+        FsProcess = tostring(InitiatingProcessFileName),
+        FsCmd = tostring(InitiatingProcessCommandLine),
+        FsAccount = tostring(InitiatingProcessAccountName)
+) on DeviceId
+| where isnull(FsTime) or FsTime between (EscalationTime - 15m .. EscalationTime + 5m)
+| join kind=leftouter (
+    DeviceFileEvents
+    | where Timestamp > ago(3d)
+    | where InitiatingProcessFileName =~ "MsMpEng.exe"
+    | where ActionType in~ ("FileCreated", "FileModified", "FileRenamed")
+    | extend FolderPathLower = tolower(FolderPath)
+    | where FolderPathLower startswith @"c:\windows\system32"
+        or FolderPathLower startswith @"c:\programdata\microsoft\windows defender"
+        or FolderPathLower startswith @"c:\program files\windows defender"
+        or FolderPathLower startswith @"c:\programdata\microsoft\windows defender advanced threat protection"
+    | project
+        DeviceId,
+        DefenderTime = Timestamp,
+        DefenderPath = tostring(FolderPath),
+        DefenderFile = tostring(FileName),
+        DefenderAction = tostring(ActionType)
+) on DeviceId
+| where isnull(DefenderTime) or DefenderTime between (EscalationTime - 10m .. EscalationTime + 10m)
+| join kind=leftouter (
+    DeviceProcessEvents
+    | where Timestamp > ago(3d)
+    | extend CmdLower = tolower(ProcessCommandLine)
+    | where CmdLower contains "whoami"
+        or CmdLower contains "net user"
+        or CmdLower contains "net localgroup"
+        or CmdLower contains "tasklist"
+        or CmdLower contains "systeminfo"
+        or CmdLower contains "sc query"
+        or CmdLower contains "reg query"
+        or CmdLower contains "qwinsta"
+        or CmdLower contains "quser"
+        or CmdLower contains "cmdkey /list"
+        or CmdLower contains "whoami /priv"
+        or CmdLower contains "whoami /groups"
+    | project
+        DeviceId,
+        PostTime = Timestamp,
+        PostCmd = ProcessCommandLine
+) on DeviceId
+| where isnull(PostTime) or PostTime between (EscalationTime .. EscalationTime + 10m)
+| join kind=leftouter (
+    DeviceLogonEvents
+    | where Timestamp > ago(3d)
+    | project
+        DeviceId,
+        LogonTime = Timestamp,
+        LogonAccount = strcat(tostring(AccountDomain), "\\", tostring(AccountName)),
+        LogonAccountSid = tostring(AccountSid),
+        LogonType,
+        LogonRemoteIP = tostring(RemoteIP)
+) on DeviceId
+| where isnull(LogonTime) or LogonTime between (EscalationTime - 15m .. EscalationTime + 15m)
+| join kind=leftouter (
+    DeviceNetworkEvents
+    | where Timestamp > ago(3d)
+    | project
+        DeviceId,
+        NetTime = Timestamp,
+        LocalIP = tostring(LocalIP),
+        RemoteIP = tostring(RemoteIP),
+        RemotePort = tostring(RemotePort),
+        RemoteUrl = tostring(RemoteUrl),
+        Protocol = tostring(Protocol),
+        NetworkInitiatingProcess = tostring(InitiatingProcessFileName),
+        NetworkInitiatingCmd = tostring(InitiatingProcessCommandLine)
+) on DeviceId
+| where isnull(NetTime) or NetTime between (EscalationTime - 10m .. EscalationTime + 10m)
+| summarize
+    FirstSeen = min(EscalationTime),
+    LastSeen = max(EscalationTime),
+
+    FsCount = countif(isnotnull(FsTime)),
+    FsPaths = make_set_if(FsPath, isnotempty(FsPath), 20),
+    FsFiles = make_set_if(FsFile, isnotempty(FsFile), 20),
+    FsActions = make_set_if(FsAction, isnotempty(FsAction), 20),
+    FsProcesses = make_set_if(FsProcess, isnotempty(FsProcess), 20),
+    FsAccounts = make_set_if(FsAccount, isnotempty(FsAccount), 20),
+
+    DefenderWriteCount = countif(isnotnull(DefenderTime)),
+    DefenderPaths = make_set_if(DefenderPath, isnotempty(DefenderPath), 20),
+    DefenderFiles = make_set_if(DefenderFile, isnotempty(DefenderFile), 20),
+    DefenderActions = make_set_if(DefenderAction, isnotempty(DefenderAction), 20),
+
+    PostCount = countif(isnotnull(PostTime)),
+    PostCommands = make_set_if(PostCmd, isnotempty(PostCmd), 20),
+
+    RelatedLogonAccounts = make_set_if(LogonAccount, isnotempty(LogonAccount), 20),
+    RelatedLogonAccountSids = make_set_if(LogonAccountSid, isnotempty(LogonAccountSid), 20),
+    RelatedLogonTypes = make_set_if(tostring(LogonType), isnotempty(tostring(LogonType)), 20),
+    RelatedLogonRemoteIPs = make_set_if(LogonRemoteIP, isnotempty(LogonRemoteIP), 20),
+
+    RelatedLocalIPs = make_set_if(LocalIP, isnotempty(LocalIP), 20),
+    RelatedRemoteIPs = make_set_if(RemoteIP, isnotempty(RemoteIP), 20),
+    RelatedRemotePorts = make_set_if(RemotePort, isnotempty(RemotePort), 20),
+    RelatedRemoteUrls = make_set_if(RemoteUrl, isnotempty(RemoteUrl), 20),
+    RelatedProtocols = make_set_if(Protocol, isnotempty(Protocol), 20),
+    RelatedNetworkProcesses = make_set_if(NetworkInitiatingProcess, isnotempty(NetworkInitiatingProcess), 20),
+    RelatedNetworkCommands = make_set_if(NetworkInitiatingCmd, isnotempty(NetworkInitiatingCmd), 20)
+
+by
+    DeviceId,
+    DeviceName,
+    EscalationAccount,
+    EscalationAccountSid,
+    InitiatingAccount,
+    InitiatingAccountName,
+    InitiatingAccountDomain,
+    InitiatingAccountSid,
+    ParentIntegrity,
+    ProcessName,
+    ProcessCmd,
+    ProcessPath,
+    ProcessId,
+    ProcessSHA1,
+    ProcessSHA256,
+    ProcessMD5,
+    ParentProcess,
+    ParentCmd,
+    ParentPath,
+    ParentProcessId,
+    ParentSHA1,
+    ParentSHA256,
+    ParentMD5,
+    SuspiciousParentChild,
+    HasDefenderReference,
+    ReportId
+| extend
+    RiskScore = 40
+        + iff(SuspiciousParentChild == 1, 15, 0)
+        + iff(HasDefenderReference == 1, 15, 0)
+        + iff(FsCount > 0, 15, 0)
+        + iff(DefenderWriteCount > 0, 15, 0)
+        + iff(PostCount >= 2, 20, 0)
+| where RiskScore >= 60
+| project
+    Timestamp = FirstSeen,
+    LastSeen,
+    DeviceName,
+    DeviceId,
+
+    EscalationAccount,
+    EscalationAccountSid,
+    InitiatingAccount,
+    InitiatingAccountName,
+    InitiatingAccountDomain,
+    InitiatingAccountSid,
+
+    RelatedLogonAccounts,
+    RelatedLogonAccountSids,
+    RelatedLogonTypes,
+    RelatedLogonRemoteIPs,
+
+    RelatedLocalIPs,
+    RelatedRemoteIPs,
+    RelatedRemotePorts,
+    RelatedRemoteUrls,
+    RelatedProtocols,
+    RelatedNetworkProcesses,
+    RelatedNetworkCommands,
+
+    ParentIntegrity,
+
+    ProcessName,
+    ProcessCmd,
+    ProcessPath,
+    ProcessId,
+    ProcessSHA1,
+    ProcessSHA256,
+    ProcessMD5,
+
+    ParentProcess,
+    ParentCmd,
+    ParentPath,
+    ParentProcessId,
+    ParentSHA1,
+    ParentSHA256,
+    ParentMD5,
+
+    SuspiciousParentChild,
+    HasDefenderReference,
+
+    FsCount,
+    FsPaths,
+    FsFiles,
+    FsActions,
+    FsProcesses,
+    FsAccounts,
+
+    DefenderWriteCount,
+    DefenderPaths,
+    DefenderFiles,
+    DefenderActions,
+
+    PostCount,
+    PostCommands,
+
+    RiskScore,
+    ReportId
+| order by RiskScore desc, Timestamp desc

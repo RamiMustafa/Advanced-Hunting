@@ -44,6 +44,7 @@ Current detection examples include:
 | ------------------------------------------- | -------------------------------------------------------------------- |
 | 🔵 **BlueHammer Detection**                 | Detects indicators and behaviors associated with BlueHammer activity |
 | 🔴 **RedSun Detection**                     | Hunting queries for RedSun-related attack patterns                   |
+| 🔴 **RoguePlanet**                          | CVE-2026-50656 / RoguePlanet hunting query                          |
 | 🖥️ **Devices Missing Weekly Full AV Scan** | Identifies endpoints that missed scheduled antivirus full scans      |
 | ⚠️ **Suspicious Process Execution**         | Detects abnormal or high-risk process behaviors                      |
 | 📜 **Abnormal PowerShell Activity**         | Identifies encoded, obfuscated, or suspicious PowerShell usage       |

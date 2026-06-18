@@ -1,0 +1,174 @@
+// CVE-2026-50656 / RoguePlanet hunting query
+// Focus: Defender Malware Protection Engine LPE + link/path manipulation + SYSTEM follow-on activity
+// Auth: Rami Mustafa, Microsoft CSA (rami.mustafa@microsoft.com)
+//#########################################################################
+
+
+let lookback = 14d;
+let correlationWindow = 30m;
+// Stage 1 - Reparse/Junction/Symlink activity
+//
+let LinkActivity =
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend Cmd = tolower(ProcessCommandLine)
+| where Cmd has_any (
+    "mklink",
+    "junction",
+    "fsutil reparsepoint",
+    "createsymboliclink",
+    "mountvol",
+    "subst",
+    "/j ",
+    "/d "
+)
+| project
+    DeviceId,
+    DeviceName,
+    LinkTime = Timestamp,
+    LinkProcess = FileName,
+    LinkCommand = ProcessCommandLine,
+    LinkUser = AccountName;
+
+//
+// Stage 2 - Defender-related activity
+//
+let DefenderActivity =
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend Cmd = tolower(ProcessCommandLine)
+| where
+    FileName in~ (
+        "MsMpEng.exe",
+        "MpCmdRun.exe",
+        "Sense.exe",
+        "NisSrv.exe"
+    )
+    or Cmd has_any (
+        "windefend",
+        "mpcmdrun",
+        "set-mppreference",
+        "add-mppreference",
+        "remove-mppreference",
+        "startscan",
+        "scan"
+    )
+| project
+    DeviceId,
+    DefenderTime = Timestamp,
+    DefenderProcess = FileName,
+    DefenderCommand = ProcessCommandLine;
+
+//
+// Stage 3 - VSS activity
+//
+let VSSActivity =
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend Cmd = tolower(ProcessCommandLine)
+| where
+    FileName in~ (
+        "vssadmin.exe",
+        "diskshadow.exe",
+        "wmic.exe"
+    )
+    or Cmd has_any (
+        "shadowcopy",
+        "shadow copy",
+        "create shadow",
+        "vss"
+    )
+| project
+    DeviceId,
+    VSSTime = Timestamp,
+    VSSProcess = FileName,
+    VSSCommand = ProcessCommandLine;
+
+//
+// Stage 4 - SYSTEM execution
+//
+let SystemExecution =
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where ProcessIntegrityLevel =~ "System"
+| project
+    DeviceId,
+    SystemTime = Timestamp,
+    SystemProcess = FileName,
+    SystemCommand = ProcessCommandLine,
+    ParentProcess = InitiatingProcessFileName,
+    ParentCommand = InitiatingProcessCommandLine,
+    SystemUser = AccountName;
+
+//
+// Stage 5 - Service or Task persistence
+//
+let PersistenceActivity =
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend Cmd = tolower(ProcessCommandLine)
+| where
+    (
+        FileName =~ "sc.exe"
+        and Cmd has "create"
+    )
+    or
+    (
+        FileName =~ "schtasks.exe"
+        and Cmd has_any (
+            "/create",
+            "/change"
+        )
+    )
+    or
+    (
+        FileName =~ "powershell.exe"
+        and Cmd has_any (
+            "new-service",
+            "register-scheduledtask"
+        )
+    )
+| project
+    DeviceId,
+    PersistTime = Timestamp,
+    PersistProcess = FileName,
+    PersistCommand = ProcessCommandLine;
+//
+// Correlate stages
+//
+LinkActivity
+| join kind=inner DefenderActivity on DeviceId
+| where DefenderTime between (LinkTime .. LinkTime + correlationWindow)
+| join kind=leftouter VSSActivity on DeviceId
+| where isnull(VSSTime)
+    or VSSTime between (LinkTime - correlationWindow .. DefenderTime + correlationWindow)
+| join kind=leftouter SystemExecution on DeviceId
+| where isnull(SystemTime)
+    or SystemTime between (DefenderTime .. DefenderTime + correlationWindow)
+| join kind=leftouter PersistenceActivity on DeviceId
+| where isnull(PersistTime)
+    or PersistTime between (DefenderTime .. DefenderTime + 2h)
+| extend
+    HasVSS = iff(isnotempty(VSSTime), 1, 0),
+    HasSystemExec = iff(isnotempty(SystemTime), 1, 0),
+    HasPersistence = iff(isnotempty(PersistTime), 1, 0)
+| extend
+    RiskScore =
+        40
+        + iff(HasVSS == 1, 20, 0)
+        + iff(HasSystemExec == 1, 25, 0)
+        + iff(HasPersistence == 1, 15, 0)
+| summarize
+    FirstSeen = min(LinkTime),
+    LastSeen = max(coalesce(PersistTime, SystemTime, DefenderTime)),
+    RiskScore = max(RiskScore),
+    LinkCommands = make_set(LinkCommand, 20),
+    DefenderCommands = make_set(DefenderCommand, 20),
+    VSSCommands = make_set(VSSCommand, 20),
+    SystemCommands = make_set(SystemCommand, 20),
+    PersistenceCommands = make_set(PersistCommand, 20),
+    SystemProcesses = make_set(SystemProcess, 20),
+    ParentProcesses = make_set(ParentProcess, 20)
+by DeviceId, DeviceName
+| where RiskScore >= 60
+| order by RiskScore desc, LastSeen desc
